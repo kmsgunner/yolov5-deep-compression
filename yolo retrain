@@ -1,0 +1,17 @@
+from ultralytics import YOLO
+import json
+
+if __name__ == '__main__':
+    # 1. 사전학습된 yolov5s 모델 로드
+    model = YOLO("yolov5s.pt")
+
+    # 2. coco128 데이터셋으로 20 epoch 재학습
+    results = model.train(data="coco128.yaml", epochs=20, imgsz=640)
+
+    # 3. 성능 지표를 딕셔너리로 변환 후 저장
+    metrics_dict = results.results_dict if hasattr(results, 'results_dict') else vars(results)
+    
+    with open("train_val_results.json", "w") as f:
+        json.dump(metrics_dict, f, indent=4)
+    
+    print("Train+Val 성능 결과를 train_val_results.json에 저장했습니다.")
