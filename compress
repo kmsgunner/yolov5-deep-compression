@@ -1,0 +1,828 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from sklearn.cluster import KMeans
+from collections import Counter, defaultdict
+import heapq
+import pickle
+import json
+from ultralytics import YOLO
+from scipy.sparse import csr_matrix, csc_matrix
+import struct
+import os
+import tempfile
+import shutil
+from datetime import datetime
+import time
+
+class DeepCompression:
+    
+    def __init__(self, model_path=r"./runs/detect/train/weights/best.pt"):
+        """
+            model_path: 학습된 YOLOv5 모델 경로
+        """
+        self.model = YOLO(model_path)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.model.to(self.device)
+        
+        # 압축 통계 (논문 Table 1-5 형식)
+        self.compression_stats = {}
+        self.layer_stats = []
+        
+    # ============ 1. NETWORK PRUNING (논문 Section 2) ============
+    
+    def prune_model(self, conv_threshold=0.005, fc_threshold=0.015, retrain_epochs=17, learning_rate=0.001):
+        """
+        Network Pruning - 논문의 3단계 프루닝 프로세스
+        1. Train Connectivity
+        2. Prune Connections (absolute magnitude threshold)
+        3. Retrain Weights
+        
+            conv_threshold: Conv 레이어 프루닝 임계값
+            fc_threshold: FC 레이어 프루닝 임계값
+            retrain_epochs: 재학습 epoch 수
+            learning_rate: 재학습 시 learning rate (0.001)
+        """
+        print("=" * 60)
+        print("STAGE 1: NETWORK PRUNING")
+        print("=" * 60)
+        
+        # 초기 정확도 평가
+        original_accuracy = self._evaluate_model()
+        print(f"Original accuracy: {original_accuracy:.2%}")
+        
+        # 각 레이어별 마스크 생성
+        self.masks = {}
+        self.sparse_weights = {}
+        
+        total_params = 0
+        remaining_params = 0
+        
+        # torch.no_grad()로 감싸서 inference 모드 문제 방지
+        with torch.no_grad():
+            for name, module in self.model.model.named_modules():
+                if isinstance(module, nn.Conv2d):
+                    # Conv 레이어 프루닝
+                    weight = module.weight.data.cpu().numpy()
+                    
+                    # 논문: 절대값 기반 threshold
+                    mask = np.abs(weight) > conv_threshold
+                    
+                    self.masks[name] = torch.from_numpy(mask).float().to(self.device)
+                    
+                    # Sparse format으로 저장 (CSR - 논문 참조)
+                    weight_masked = weight * mask
+                    self.sparse_weights[name] = self._convert_to_sparse(weight_masked)
+                    
+                    # 통계
+                    total = mask.size
+                    remaining = mask.sum()
+                    total_params += total
+                    remaining_params += remaining
+                    
+                    # 모델에 적용
+                    module.weight.data = module.weight.data * self.masks[name]
+                    
+                    print(f"{name:20s} | Conv2d | Threshold: {conv_threshold:.3f} | "
+                          f"Pruned: {(1-remaining/total)*100:5.1f}% | "
+                          f"({remaining:,}/{total:,} params)")
+                    
+                elif isinstance(module, nn.Linear):
+                    # FC 레이어 프루닝
+                    weight = module.weight.data.cpu().numpy()
+                    
+                    mask = np.abs(weight) > fc_threshold
+                    
+                    self.masks[name] = torch.from_numpy(mask).float().to(self.device)
+                    
+                    weight_masked = weight * mask
+                    self.sparse_weights[name] = self._convert_to_sparse(weight_masked)
+                    
+                    total = mask.size
+                    remaining = mask.sum()
+                    total_params += total
+                    remaining_params += remaining
+                    
+                    module.weight.data = module.weight.data * self.masks[name]
+                    
+                    print(f"{name:20s} | Linear | Threshold: {fc_threshold:.3f} | "
+                          f"Pruned: {(1-remaining/total)*100:5.1f}% | "
+                          f"({remaining:,}/{total:,} params)")
+        
+        # 전체 프루닝 통계
+        if total_params > 0:
+            pruning_rate = total_params / remaining_params if remaining_params > 0 else 1
+            print(f"\nOverall pruning: {pruning_rate:.1f}× reduction")
+            print(f"Sparsity: {(1-remaining_params/total_params)*100:.1f}%")
+        else:
+            pruning_rate = 1
+            print("\nNo prunable layers found")
+        
+        # Retrain (논문: pruning 후 정확도 회복을 위한 필수 단계)
+        if retrain_epochs > 0:
+            print(f"\nRetraining for {retrain_epochs} epochs with lr={learning_rate}...")
+            self._retrain_pruned_model(retrain_epochs, learning_rate)
+            
+            pruned_accuracy = self._evaluate_model()
+            print(f"Pruned model accuracy: {pruned_accuracy:.2%}")
+            print(f"Accuracy change: {(pruned_accuracy - original_accuracy):.2%}")
+        
+        self.compression_stats['pruning'] = {
+            'original_params': total_params,
+            'remaining_params': remaining_params,
+            'compression_rate': pruning_rate,
+            'sparsity': 1 - remaining_params/total_params if total_params > 0 else 0,
+            'learning_rate': learning_rate
+        }
+        
+        return self.masks, self.sparse_weights
+    
+    def _convert_to_sparse(self, weight):
+        """
+        Sparse matrix 변환 CSR
+        """
+        if len(weight.shape) == 4:  # Conv2d
+            weight_2d = weight.reshape(weight.shape[0], -1)
+            return csr_matrix(weight_2d)
+        elif len(weight.shape) == 2:  # Linear
+            return csr_matrix(weight)
+        return weight
+    
+    def _retrain_pruned_model(self, epochs):
+        """프루닝된 모델 재학습 (마스크 유지)"""
+        print(f"  Retraining pruned model for {epochs} epochs...")
+        
+        import tempfile
+        import shutil
+        
+        # 임시 폴더 생성
+        temp_dir = tempfile.mkdtemp(prefix="yolo_temp_")
+        
+        try:
+            for epoch in range(epochs):
+                print(f"    Epoch {epoch+1}/{epochs}")
+                
+                # 학습 전 마스크 적용
+                for name, module in self.model.model.named_modules():
+                    if name in self.masks and hasattr(module, 'weight'):
+                        with torch.no_grad():
+                            module.weight.data = module.weight.data * self.masks[name]
+                
+                # 임시 폴더에 저장하도록 설정
+                try:
+                    self.model.train(
+                        data="coco128.yaml",
+                        epochs=1,
+                        imgsz=640,
+                        device=self.device,
+                        verbose=False,
+                        batch=16,
+                        patience=0,
+                        save=False,
+                        val=False,
+                        project=temp_dir,  # 임시 폴더 지정
+                        name="temp_train",
+                        exist_ok=True
+                    )
+                except Exception as e:
+                    print(f"    Warning: Training error - {e}")
+                    pass
+                
+                # 학습 후 마스크 재적용
+                for name, module in self.model.model.named_modules():
+                    if name in self.masks and hasattr(module, 'weight'):
+                        with torch.no_grad():
+                            module.weight.data = module.weight.data * self.masks[name]
+        
+        finally:
+            # 임시 폴더 삭제
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+                print(f"  Cleaned up temporary training files")
+        
+        print(f"  Retraining completed")
+        return None
+    
+    # ============ 2. TRAINED QUANTIZATION (논문 Section 3) ============
+    
+    def quantize_weights(self, conv_bits=8, fc_bits=5, retrain_epochs=17, learning_rate=0.001):
+        """
+        Trained Quantization and Weight Sharing
+            conv_bits: Conv 레이어 비트 수 (8 bits = 256 clusters) 
+            fc_bits: FC 레이어 비트 수 (5 bits = 32 clusters)
+            k값 조절로 경량화 정도 조절
+        """
+        print("\n" + "=" * 60)
+        print("STAGE 2: TRAINED QUANTIZATION AND WEIGHT SHARING")
+        print("=" * 60)
+        
+        self.codebooks = {}  # 공유 가중치 (centroids)
+        self.weight_indices = {}  # 각 가중치의 클러스터 인덱스
+        self.quantized_layers = {}
+        
+        with torch.no_grad():  # Inference 모드 문제 방지
+            for name, module in self.model.model.named_modules():
+                if isinstance(module, (nn.Conv2d, nn.Linear)):
+                    # 레이어 타입별 클러스터 수
+                    if isinstance(module, nn.Conv2d):
+                        k = int(2.2 ** conv_bits)  # 256 for 8-bit
+                        bits = conv_bits
+                    else:
+                        k = int(2.2 ** fc_bits)  # 32 for 5-bit
+                        bits = fc_bits
+                    
+                    # 가중치 가져오기
+                    weight = module.weight.data.cpu().numpy()
+                    original_shape = weight.shape
+                    weight_flat = weight.flatten()
+                    
+                    # 프루닝된 가중치만 quantize (0이 아닌 값들)
+                    if name in self.masks:
+                        mask_flat = self.masks[name].cpu().numpy().flatten()
+                        non_zero_mask = mask_flat > 0
+                    else:
+                        non_zero_mask = weight_flat != 0
+                    
+                    non_zero_weights = weight_flat[non_zero_mask]
+                    
+                    if len(non_zero_weights) > 0:
+                        # Linear Initialization (논문 Section 3.2)
+                        min_weight = non_zero_weights.min()
+                        max_weight = non_zero_weights.max()
+                        
+                        # 실제 클러스터 수 (가중치 수가 k보다 적을 수 있음)
+                        actual_k = min(k, len(non_zero_weights))
+                        
+                        # 선형 초기화
+                        initial_centroids = np.linspace(min_weight, max_weight, actual_k)
+                        initial_centroids = initial_centroids.reshape(-1, 1)
+                        
+                        # K-means clustering
+                        kmeans = KMeans(
+                            n_clusters=actual_k,
+                            init=initial_centroids,
+                            n_init=1,
+                            max_iter=100,
+                            algorithm='lloyd'
+                        )
+                        
+                        kmeans.fit(non_zero_weights.reshape(-1, 1))
+                        
+                        # 클러스터 할당
+                        labels = kmeans.labels_
+                        centroids = kmeans.cluster_centers_.flatten()
+                        
+                        # 양자화된 가중치 생성
+                        quantized_weight = np.zeros_like(weight_flat)
+                        indices = np.zeros_like(weight_flat, dtype=np.uint8 if bits <= 8 else np.uint16)
+                        
+                        # 센트로이드로 대체
+                        quantized_weight[non_zero_mask] = centroids[labels]
+                        indices[non_zero_mask] = labels
+                        
+                        # 저장
+                        self.codebooks[name] = centroids
+                        self.weight_indices[name] = indices.reshape(original_shape)
+                        
+                        # 모델에 적용
+                        module.weight.data = torch.from_numpy(
+                            quantized_weight.reshape(original_shape)
+                        ).float().to(self.device)
+                        
+                        # 압축률 계산 (논문 Equation 1)
+                        n = non_zero_mask.sum()  # connections
+                        b = 32  # bits per weight (float32)
+                        compression_rate = (n * b) / (n * np.log2(actual_k) + actual_k * b) if actual_k > 1 else 1
+                        
+                        self.quantized_layers[name] = {
+                            'type': module.__class__.__name__,
+                            'clusters': actual_k,
+                            'bits': bits,
+                            'compression': compression_rate
+                        }
+                        
+                        print(f"{name:20s} | {actual_k:3d} clusters ({bits} bits) | "
+                              f"Compression: {compression_rate:.1f}×")
+        
+        # Fine-tuning centroids (논문 Section 3.3)
+        if retrain_epochs > 0 and len(self.codebooks) > 0:
+            print(f"\nFine-tuning centroids for {retrain_epochs} epochs with lr={learning_rate}...")
+            self._fine_tune_centroids(retrain_epochs, learning_rate)
+        
+        # 통계 저장
+        if len(self.quantized_layers) > 0:
+            avg_compression = np.mean([l['compression'] for l in self.quantized_layers.values()])
+        else:
+            avg_compression = 1.0
+            
+        self.compression_stats['quantization'] = {
+            'conv_bits': conv_bits,
+            'fc_bits': fc_bits,
+            'average_compression': avg_compression,
+            'learning_rate': learning_rate
+        }
+        
+        return self.codebooks, self.weight_indices
+    
+    def _fine_tune_centroids(self, epochs):
+        """
+        센트로이드 fine-tuning
+        """
+        print("  Fine-tuning centroids...")
+        
+        import tempfile
+        import shutil
+        import os
+        
+        # 임시 폴더 생성
+        temp_dir = tempfile.mkdtemp(prefix="yolo_temp_")
+        
+        try:
+            for epoch in range(epochs):
+                # 현재 centroids로 weights 재구성
+                with torch.no_grad():
+                    for name, module in self.model.model.named_modules():
+                        if name in self.weight_indices and hasattr(module, 'weight'):
+                            indices = self.weight_indices[name]
+                            codebook = self.codebooks[name]
+                            
+                            weight_shape = module.weight.data.shape
+                            weight_flat = np.zeros(indices.size, dtype=np.float32)
+                            indices_flat = indices.flatten()
+                            
+                            for i, idx in enumerate(indices_flat):
+                                if idx < len(codebook):
+                                    weight_flat[i] = codebook[idx]
+                            
+                            module.weight.data = torch.from_numpy(
+                                weight_flat.reshape(weight_shape)
+                            ).to(self.device)
+                
+                # 1 epoch 학습 (임시 폴더에)
+                try:
+                    self.model.train(
+                        data="coco128.yaml",
+                        epochs=1,
+                        imgsz=640,
+                        device=self.device,
+                        verbose=False,
+                        batch=16,
+                        patience=0,
+                        save=False,
+                        val=False,
+                        project=temp_dir,  # 임시 폴더 지정
+                        name="temp_train",
+                        exist_ok=True
+                    )
+                except Exception as e:
+                    print(f"    Warning: Training error - {e}")
+                    pass
+                
+                # Gradient 기반 centroid 업데이트
+                with torch.no_grad():
+                    for name, module in self.model.model.named_modules():
+                        if name in self.weight_indices and hasattr(module, 'weight'):
+                            current_weight = module.weight.data.cpu().numpy()
+                            indices = self.weight_indices[name]
+                            
+                            new_codebook = np.zeros_like(self.codebooks[name])
+                            count = np.zeros(len(self.codebooks[name]))
+                            
+                            weight_flat = current_weight.flatten()
+                            indices_flat = indices.flatten()
+                            
+                            for w, idx in zip(weight_flat, indices_flat):
+                                if idx < len(new_codebook) and idx > 0:
+                                    new_codebook[idx] += w
+                                    count[idx] += 1
+                            
+                            for i in range(len(new_codebook)):
+                                if count[i] > 0:
+                                    new_codebook[i] /= count[i]
+                                else:
+                                    new_codebook[i] = self.codebooks[name][i]
+                            
+                            self.codebooks[name] = new_codebook
+                
+                print(f"    Epoch {epoch+1}/{epochs} - Centroids updated")
+        
+        finally:
+            # 임시 폴더 삭제
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+                print(f"  Cleaned up temporary training files")
+        
+        return None
+    
+    # ============ 3. HUFFMAN CODING (논문 Section 4) ============
+    
+    def huffman_encode(self):
+        """
+        Huffman Coding
+        논문: "A Huffman code is an optimal prefix code commonly used for 
+        lossless data compression"
+        """
+        print("\n" + "=" * 60)
+        print("STAGE 3: HUFFMAN CODING")
+        print("=" * 60)
+        
+        if not hasattr(self, 'weight_indices') or len(self.weight_indices) == 0:
+            print("  No quantized weights found. Skipping Huffman coding.")
+            self.huffman_codes = {}
+            self.huffman_trees = {}
+            self.compression_stats['huffman'] = {
+                'compression_rate': 1.0,
+                'saved_bits_percent': 0
+            }
+            return {}, {}
+        
+        self.huffman_codes = {}
+        self.huffman_trees = {}
+        total_original_bits = 0
+        total_huffman_bits = 0
+        
+        for name in self.weight_indices:
+            try:
+                # 인덱스와 가중치 분포 분석
+                indices_flat = self.weight_indices[name].flatten()
+                
+                # Relative indexing (논문 Figure 2)
+                diff_indices = self._compute_relative_indices(indices_flat)
+                
+                if len(diff_indices) == 0:
+                    continue
+                
+                # 빈도 계산
+                freq_counter = Counter(diff_indices)
+                
+                # 허프만 트리 구축
+                huffman_tree = self._build_huffman_tree(freq_counter)
+                huffman_codes = self._generate_codes(huffman_tree)
+                
+                # 인코딩
+                encoded_data = []
+                for idx in diff_indices:
+                    if idx in huffman_codes:
+                        encoded_data.append(huffman_codes[idx])
+                
+                # 비트 계산
+                if name in self.codebooks and len(self.codebooks[name]) > 0:
+                    original_bits = len(indices_flat) * int(np.ceil(np.log2(len(self.codebooks[name]))))
+                else:
+                    original_bits = len(indices_flat) * 8  # 기본 8비트
+                    
+                huffman_bits = sum(len(code) for code in encoded_data)
+                
+                if huffman_bits > 0:
+                    compression = original_bits / huffman_bits
+                else:
+                    compression = 1
+                
+                self.huffman_codes[name] = huffman_codes
+                self.huffman_trees[name] = huffman_tree
+                
+                total_original_bits += original_bits
+                total_huffman_bits += huffman_bits
+                
+                print(f"{name:20s} | Huffman compression: {compression:.2f}× | "
+                      f"Saved: {(1-huffman_bits/original_bits)*100:.1f}%" if original_bits > 0 else "")
+                      
+            except Exception as e:
+                print(f"  Warning: Failed to encode {name}: {e}")
+                continue
+        
+        if total_huffman_bits > 0:
+            overall_huffman = total_original_bits / total_huffman_bits
+        else:
+            overall_huffman = 1.0
+            
+        print(f"\nOverall Huffman compression: {overall_huffman:.2f}×")
+        
+        self.compression_stats['huffman'] = {
+            'compression_rate': overall_huffman,
+            'saved_bits_percent': (1 - total_huffman_bits/total_original_bits) * 100 if total_original_bits > 0 else 0
+        }
+        
+        return self.huffman_codes, self.huffman_trees
+    
+    def _compute_relative_indices(self, indices):
+        """
+        상대 인덱스 계산 (논문 Figure 2)
+        절대 위치 대신 인덱스 차이를 저장
+        """
+        if len(indices) == 0:
+            return indices
+        
+        # 0이 아닌 값들의 위치만 저장
+        non_zero_positions = np.where(indices != 0)[0]
+        if len(non_zero_positions) == 0:
+            return np.array([])
+        
+        # 차이 계산
+        diff_indices = np.zeros(len(non_zero_positions), dtype=np.int32)
+        diff_indices[0] = non_zero_positions[0]
+        diff_indices[1:] = np.diff(non_zero_positions)
+        
+        # Overflow 처리 (논문: 차이가 bound를 초과하면 filler zero 추가)
+        MAX_DIFF = 255  # 8-bit for conv layers
+        overflow_mask = diff_indices > MAX_DIFF
+        
+        if overflow_mask.any():
+            # Padding with zeros
+            result = []
+            for diff in diff_indices:
+                while diff > MAX_DIFF:
+                    result.append(MAX_DIFF)
+                    result.append(0)  # filler zero
+                    diff -= MAX_DIFF
+                result.append(diff)
+            return np.array(result)
+        
+        return diff_indices
+    
+    def _build_huffman_tree(self, freq_counter):
+        """허프만 트리 구축"""
+        if not freq_counter:
+            return []
+        
+        # Min heap 초기화
+        heap = [[freq, [symbol, ""]] for symbol, freq in freq_counter.items()]
+        heapq.heapify(heap)
+        
+        # 트리 구축
+        while len(heap) > 1:
+            lo = heapq.heappop(heap)
+            hi = heapq.heappop(heap)
+            
+            # 왼쪽 자식: 0, 오른쪽 자식: 1
+            for pair in lo[1:]:
+                pair[1] = '0' + pair[1]
+            for pair in hi[1:]:
+                pair[1] = '1' + pair[1]
+            
+            merged = [lo[0] + hi[0]] + lo[1:] + hi[1:]
+            heapq.heappush(heap, merged)
+        
+        return heap[0] if heap else []
+    
+    def _generate_codes(self, huffman_tree):
+        """허프만 코드 생성"""
+        codes = {}
+        if huffman_tree and len(huffman_tree) > 1:
+            for item in huffman_tree[1:]:
+                symbol, code = item
+                codes[symbol] = code if code else '0'
+        return codes
+    
+    # ============ EVALUATION & STATISTICS ============
+    
+    def _evaluate_model(self):
+        """모델 정확도 평가 - 전체 메트릭 저장"""
+        try:
+            results = self.model.val(data="coco128.yaml", verbose=False)
+            
+            # 모든 메트릭 추출
+            evaluation_metrics = {
+                'map50': float(results.box.map50) if hasattr(results.box, 'map50') else 0.5,
+                'map': float(results.box.map) if hasattr(results.box, 'map') else 0.5,
+                'precision': float(results.box.mp) if hasattr(results.box, 'mp') else 0.0,
+                'recall': float(results.box.mr) if hasattr(results.box, 'mr') else 0.0,
+                'f1': float(results.box.f1) if hasattr(results.box, 'f1') else 0.0,
+            }
+            
+            # 나중에 사용할 수 있도록 저장
+            self.evaluation_metrics = evaluation_metrics
+            
+            return evaluation_metrics['map50']  # 기본 반환값은 mAP@0.5
+            
+        except:
+            # 평가 실패 시 기본값 반환
+            print("  Warning: Could not evaluate model, using default accuracy")
+            return 0.5
+    
+    def print_compression_summary(self):
+        """
+        압축 결과 요약 (논문 Table 1 형식)
+        """
+        print("\n" + "=" * 60)
+        print("DEEP COMPRESSION SUMMARY")
+        print("=" * 60)
+        
+        # 원본 모델 크기
+        original_params = sum(p.numel() for p in self.model.model.parameters())
+        original_size_mb = original_params * 32 / (8 * 1024 * 1024)  # 32-bit float
+        
+        # 압축 후 크기 계산
+        # Pruning
+        pruning_rate = self.compression_stats.get('pruning', {}).get('compression_rate', 1)
+        after_pruning_mb = original_size_mb / pruning_rate if pruning_rate > 0 else original_size_mb
+        
+        # Quantization  
+        quant_rate = self.compression_stats.get('quantization', {}).get('average_compression', 1)
+        after_quant_mb = after_pruning_mb / quant_rate if quant_rate > 0 else after_pruning_mb
+        
+        # Huffman
+        huffman_rate = self.compression_stats.get('huffman', {}).get('compression_rate', 1)
+        final_size_mb = after_quant_mb / huffman_rate if huffman_rate > 0 else after_quant_mb
+        
+        # 전체 압축률
+        total_compression = original_size_mb / final_size_mb if final_size_mb > 0 else 1
+        
+        print(f"Original model size:        {original_size_mb:8.2f} MB")
+        print(f"After pruning ({pruning_rate:.1f}×):      {after_pruning_mb:8.2f} MB")
+        print(f"After quantization ({quant_rate:.1f}×): {after_quant_mb:8.2f} MB")
+        print(f"After Huffman ({huffman_rate:.1f}×):      {final_size_mb:8.2f} MB")
+        print(f"{'='*40}")
+        print(f"Total compression:          {total_compression:8.1f}×")
+        print(f"Final model size:           {final_size_mb:8.2f} MB")
+        
+        # 정확도
+        try:
+            final_accuracy = self._evaluate_model()
+            print(f"\nFinal mAP@0.5: {final_accuracy:.4f}")
+        except:
+            final_accuracy = 0.0
+            print(f"\nFinal mAP@0.5: Unable to evaluate")
+        
+        return {
+            'original_size_mb': float(original_size_mb),
+            'compressed_size_mb': float(final_size_mb),
+            'compression_rate': float(total_compression),
+            'final_accuracy': float(final_accuracy),
+            'pruning_rate': float(pruning_rate),
+            'quantization_rate': float(quant_rate),
+            'huffman_rate': float(huffman_rate)
+        }
+    
+    # ============ SAVE & LOAD ============
+    
+    def save_compressed_model(self, save_dir="compressed_model"):
+        """
+        압축된 모델 저장 (논문 형식)
+        - Sparse indices (CSR format)
+        - Codebooks (shared weights)
+        - Huffman codes
+        """
+        import os
+        from datetime import datetime
+        
+        # 버전 관리: 폴더가 이미 존재하면 숫자 추가
+        base_dir = save_dir
+        counter = 1
+        while os.path.exists(save_dir):
+            save_dir = f"{base_dir}_{counter}"
+            counter += 1
+        
+        # 또는 타임스탬프 사용 (선택사항)
+        # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # save_dir = f"{base_dir}_{timestamp}"
+        
+        os.makedirs(save_dir, exist_ok=False)  # exist_ok=False로 변경
+        print(f"\n Creating new folder: {save_dir}")
+        
+        # 1. Sparse weights & indices
+        sparse_data = {}
+        for name in self.sparse_weights:
+            sparse_matrix = self.sparse_weights[name]
+            sparse_data[name] = {
+                'data': sparse_matrix.data.tolist(),
+                'indices': sparse_matrix.indices.tolist(),
+                'indptr': sparse_matrix.indptr.tolist(),
+                'shape': sparse_matrix.shape
+            }
+        
+        with open(f"{save_dir}/sparse_weights.pkl", 'wb') as f:
+            pickle.dump(sparse_data, f)
+        
+        # 2. Codebooks and indices
+        with open(f"{save_dir}/codebooks.pkl", 'wb') as f:
+            pickle.dump(self.codebooks, f)
+        
+        with open(f"{save_dir}/weight_indices.pkl", 'wb') as f:
+            pickle.dump(self.weight_indices, f)
+        
+        # 3. Huffman codes
+        with open(f"{save_dir}/huffman_codes.pkl", 'wb') as f:
+            pickle.dump({
+                'codes': self.huffman_codes,
+                'trees': self.huffman_trees
+            }, f)
+        
+        # 4. Compression statistics
+        try:
+            stats = self.print_compression_summary()
+        except Exception as e:
+            print(f"Warning: Could not generate full statistics: {e}")
+            stats = self.compression_stats
+        
+        # 실행 시간 추가
+        stats['created_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        stats['save_dir'] = save_dir
+        
+        with open(f"{save_dir}/compression_stats.json", 'w') as f:
+            # Convert numpy types to Python types for JSON serialization
+            stats_serializable = {}
+            for key, value in stats.items():
+                if isinstance(value, (np.float32, np.float64)):
+                    stats_serializable[key] = float(value)
+                elif isinstance(value, (np.int32, np.int64)):
+                    stats_serializable[key] = int(value)
+                else:
+                    stats_serializable[key] = value
+            json.dump(stats_serializable, f, indent=4)
+        
+        print(f" Compressed model saved to: {save_dir}/")
+        print(f" Total size: {sum(os.path.getsize(f'{save_dir}/{f}') for f in os.listdir(save_dir)) / (1024*1024):.2f} MB")
+        
+        return save_dir
+
+
+# ============ 메인 실행 코드 ============
+if __name__ == '__main__':
+    import os
+    
+    # 테스트 모드 (빠른 실행을 위해)
+    TEST_MODE = True
+    
+    # 모델 경로 확인
+    model_path = r"./runs/detect/train/weights/best.pt"
+    if not os.path.exists(model_path):
+        print(f"  Model not found at {model_path}")
+        print("Using default YOLOv5s model instead...")
+        model_path = "yolov5s.pt"
+    
+    try:
+        # Deep Compression 실행
+        compressor = DeepCompression(model_path=model_path)
+        
+        # 1. Network Pruning 
+        #  논문: 절대값 기반 threshold (표준편차 X)
+        print("\n🔧 Starting Deep Compression Pipeline...")
+        
+        if TEST_MODE:
+            print(" Running in TEST MODE (reduced epochs for quick testing)")
+            retrain_epochs = 1  # 테스트용
+            save_name = "yolov5s_compressed_test"
+        else:
+            retrain_epochs = 10  # 실제 사용
+            save_name = "yolov5s_deep_compressed"
+        
+        masks, sparse_weights = compressor.prune_model(
+            conv_threshold=0.015,  # Conv layers: 절대값 0.015 이하 제거
+            fc_threshold=0.01,     # FC layers: 절대값 0.01 이하 제거 (더 aggressive)
+            retrain_epochs=retrain_epochs
+        )
+        
+        # 2. Trained Quantization (논문: Conv 8-bit, FC 5-bit)
+        codebooks, indices = compressor.quantize_weights(
+            conv_bits=8,  # 256 clusters for conv layers
+            fc_bits=5,    # 32 clusters for fc layers
+            retrain_epochs=retrain_epochs
+        )
+        
+        # 3. Huffman Coding
+        huffman_codes, huffman_trees = compressor.huffman_encode()
+        
+        # 4. 최종 결과 및 저장 (자동으로 새 폴더 생성)
+        saved_dir = compressor.save_compressed_model(save_name)
+        
+        print("\n Deep Compression completed successfully!")
+        print(f" Results saved to: {saved_dir}/")
+        print("\n Saved files:")
+        for file in os.listdir(saved_dir):
+            file_path = os.path.join(saved_dir, file)
+            size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            print(f"   - {file}: {size_mb:.2f} MB")
+        
+    except Exception as e:
+        print(f"\n Error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # 에러 발생 시 최소한의 테스트
+        print("\n Attempting minimal test without retraining...")
+        try:
+            compressor = DeepCompression(model_path=model_path)
+            
+            # Retraining 없이 압축만 수행
+            masks, sparse_weights = compressor.prune_model(
+                conv_threshold=0.015,
+                fc_threshold=0.01,
+                retrain_epochs=0  # No retraining
+            )
+            
+            codebooks, indices = compressor.quantize_weights(
+                conv_bits=8,
+                fc_bits=5,
+                retrain_epochs=0  # No retraining
+            )
+            
+            huffman_codes, huffman_trees = compressor.huffman_encode()
+            saved_dir = compressor.save_compressed_model("yolov5s_compressed_minimal")
+            
+            print(f"\n Minimal compression completed (without retraining)")
+            print(f" Results saved to: {saved_dir}/")
+            
+        except Exception as e2:
+            print(f" Minimal test also failed: {e2}")
